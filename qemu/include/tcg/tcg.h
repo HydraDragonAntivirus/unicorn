@@ -946,8 +946,15 @@ static inline bool tcg_op_buf_full(TCGContext *tcg_ctx)
      * branch within the TB.  We also need to be mindful of the
      * 16-bit unsigned offsets, TranslationBlock.jmp_reset_offset[]
      * and TCGContext.gen_insn_end_off[].
+     *
+     * Unicorn: also stop before the temps run out. Some translations
+     * allocate temps they never free (tcg_const_* in the x87 paths, our
+     * instrumentation), and tcg_temp_alloc only asserts in debug builds,
+     * so a long TB of such instructions (512 x FFREE) wrote past temps[]
+     * into the ops list that follows it and crashed in tcg_emit_op.
+     * The margin covers the temps of one instruction and the TB epilogue.
      */
-    return tcg_ctx->nb_ops >= 4000;
+    return tcg_ctx->nb_ops >= 4000 || tcg_ctx->nb_temps >= TCG_MAX_TEMPS - 128;
 }
 
 /* pool based memory allocation */

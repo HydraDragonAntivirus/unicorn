@@ -6928,12 +6928,15 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
 
             if (update_fip) {
+                TCGv fpip = tcg_const_tl(tcg_ctx, pc_start - s->cs_base);
+
                 tcg_gen_ld_i32(tcg_ctx, s->tmp2_i32, tcg_ctx->cpu_env,
                                 offsetof(CPUX86State, segs[R_CS].selector));
                 tcg_gen_st16_i32(tcg_ctx, s->tmp2_i32, tcg_ctx->cpu_env,
                                     offsetof(CPUX86State, fpcs));
-                tcg_gen_st_tl(tcg_ctx, tcg_const_tl(tcg_ctx, pc_start - s->cs_base),
-                                tcg_ctx->cpu_env, offsetof(CPUX86State, fpip));
+                tcg_gen_st_tl(tcg_ctx, fpip, tcg_ctx->cpu_env, offsetof(CPUX86State, fpip));
+                /* Unicorn: every x87 instruction allocated this temp and never freed it. */
+                tcg_temp_free(tcg_ctx, fpip);
             }
         }
         break;
