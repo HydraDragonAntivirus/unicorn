@@ -864,144 +864,142 @@ static inline void *alloc_code_gen_buffer(struct uc_struct *uc)
 }
 #elif defined(_WIN32)
 #define COMMIT_COUNT (1024) // Commit 4MB per exception
-#define CLOSURE_SIZE (4096)
 
-#ifdef _WIN64
-static LONG code_gen_buffer_handler(PEXCEPTION_POINTERS ptr, struct uc_struct *uc)
-#else
 /*
-The first two DWORD or smaller arguments that are found in the argument list
-from left to right are passed in ECX and EDX registers; all other arguments
-are passed on the stack from right to left.
-*/
-static LONG __fastcall code_gen_buffer_handler(PEXCEPTION_POINTERS ptr, struct uc_struct* uc)
-#endif
+ * The code buffer is only reserved; pages are committed on the access violation
+ * of their first use. A vectored exception handler is process-wide: every thread's
+ * access violation goes through all of them. With one handler per instance, an
+ * instance closed in one thread (handler removed, its trampoline and uc_struct freed)
+ * could still be running in another thread's dispatch: a use-after-free that crashed
+ * or hung processes running instances in parallel threads.
+ *
+ * So there is one handler for the whole process, registered once and never removed,
+ * and a table of the reserved buffers behind an SRW lock: the handler looks an
+ * address up under the shared lock, an instance enters / leaves the table under the
+ * exclusive one (leaving before the buffer is released). Nothing the handler touches
+ * is freed while it runs.
+ */
+typedef struct CodeGenRegion {
+    uint8_t *left;
+    uint8_t *right;
+} CodeGenRegion;
+
+static SRWLOCK code_gen_regions_lock = SRWLOCK_INIT;
+static CodeGenRegion *code_gen_regions;
+static size_t code_gen_regions_len;
+static size_t code_gen_regions_cap;
+static INIT_ONCE code_gen_handler_once = INIT_ONCE_STATIC_INIT;
+static PVOID code_gen_handler;
+
+static LONG CALLBACK code_gen_buffer_handler(PEXCEPTION_POINTERS ptr)
 {
     PEXCEPTION_RECORD record = ptr->ExceptionRecord;
-    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        uint8_t* base = (uint8_t*)(record->ExceptionInformation[1]);
-        uint8_t* left = uc->tcg_ctx->initial_buffer;
-        uint8_t* right = left + uc->tcg_ctx->initial_buffer_size;
-        if (left && base >= left && base < right) {
-            // It's our region
-            uint8_t* base_end = base + COMMIT_COUNT * 4096;
-            uint32_t size = COMMIT_COUNT * 4096;
-            if (base_end >= right) {
-                size = base_end - base;
-                // whoops, we are almost run out of memory! Commit all instead
+    LONG ret = EXCEPTION_CONTINUE_SEARCH;
+    size_t i;
+
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        record->NumberParameters < 2) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    uint8_t *base = (uint8_t *)(record->ExceptionInformation[1]);
+    AcquireSRWLockShared(&code_gen_regions_lock);
+    for (i = 0; i < code_gen_regions_len; i++) {
+        uint8_t *left = code_gen_regions[i].left;
+        uint8_t *right = code_gen_regions[i].right;
+        if (base >= left && base < right) {
+            // It's a code buffer: commit from here, at most to its end.
+            size_t size = COMMIT_COUNT * 4096;
+            if ((size_t)(right - base) < size) {
+                size = right - base;
             }
             if (VirtualAlloc(base, size, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
-                return EXCEPTION_CONTINUE_EXECUTION;
-            } else {
-                return EXCEPTION_CONTINUE_SEARCH;
+                ret = EXCEPTION_CONTINUE_EXECUTION;
             }
+            break;
         }
     }
-    return EXCEPTION_CONTINUE_SEARCH;
+    ReleaseSRWLockShared(&code_gen_regions_lock);
+    return ret;
 }
 
-static inline void may_remove_handler(struct uc_struct *uc) {
-    if (uc->seh_closure) {
-        if (uc->seh_handle) {
-            RemoveVectoredExceptionHandler(uc->seh_handle);
-        }
-        VirtualFree(uc->seh_closure, 0, MEM_RELEASE);
+static BOOL CALLBACK code_gen_handler_install(PINIT_ONCE once, PVOID param,
+                                              PVOID *ctx)
+{
+    code_gen_handler = AddVectoredExceptionHandler(0, code_gen_buffer_handler);
+    return code_gen_handler != NULL;
+}
+
+static bool code_gen_region_add(uint8_t *buf, size_t size)
+{
+    bool ok = true;
+
+    if (!InitOnceExecuteOnce(&code_gen_handler_once, code_gen_handler_install,
+                             NULL, NULL)) {
+        return false;
     }
+    AcquireSRWLockExclusive(&code_gen_regions_lock);
+    if (code_gen_regions_len == code_gen_regions_cap) {
+        size_t cap = code_gen_regions_cap ? code_gen_regions_cap * 2 : 16;
+        CodeGenRegion *grown =
+            realloc(code_gen_regions, cap * sizeof(CodeGenRegion));
+        if (grown) {
+            code_gen_regions = grown;
+            code_gen_regions_cap = cap;
+        } else {
+            ok = false;
+        }
+    }
+    if (ok) {
+        code_gen_regions[code_gen_regions_len].left = buf;
+        code_gen_regions[code_gen_regions_len].right = buf + size;
+        code_gen_regions_len++;
+    }
+    ReleaseSRWLockExclusive(&code_gen_regions_lock);
+    return ok;
+}
+
+static void code_gen_region_remove(uint8_t *buf)
+{
+    size_t i;
+
+    AcquireSRWLockExclusive(&code_gen_regions_lock);
+    for (i = 0; i < code_gen_regions_len; i++) {
+        if (code_gen_regions[i].left == buf) {
+            code_gen_regions[i] = code_gen_regions[code_gen_regions_len - 1];
+            code_gen_regions_len--;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&code_gen_regions_lock);
 }
 
 static inline void *alloc_code_gen_buffer(struct uc_struct *uc)
 {
     TCGContext *tcg_ctx = uc->tcg_ctx;
     size_t size = tcg_ctx->code_gen_buffer_size;
-    uint8_t *closure, *data;
-    uint8_t *ptr;
-    void* handler = code_gen_buffer_handler;
+    uint8_t *buf;
 
-    may_remove_handler(uc);    
+    // Called once per instance (`tcg_exec_init`); the shared handler replaces the
+    // per-instance one these fields were for.
+    uc->seh_handle = NULL;
+    uc->seh_closure = NULL;
 
-    // Naive trampoline implementation
-    closure = VirtualAlloc(NULL, CLOSURE_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    if (!closure) {
+    buf = VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!buf) {
         return NULL;
     }
-    uc->seh_closure = closure;
-    data = closure + CLOSURE_SIZE /2;
-    
-#ifdef _WIN64
-    ptr = closure;
-    *ptr = 0x48; // REX.w
-    ptr += 1;
-    *ptr = 0xb8; // mov rax
-    ptr += 1;
-    memcpy(ptr, &data, 8); // mov rax, &data
-    ptr += 8;
-    // ; rax = &data
-    // mov [rax], rdx ; save rdx
-    // mov rdx, [rax+0x8] ; move uc pointer to 2nd arg
-    // sub rsp, 0x10; reserve 2 slots as ms fastcall requires
-    // call [rax + 0x10] ; go to handler
-    const char tramp[] = "\x48\x89\x10\x48\x8b\x50\x08\x48\x83\xec\x10\xff\x50\x10";
-    memcpy(ptr, (void*)tramp, sizeof(tramp) - 1); // Note last zero!
-    ptr += sizeof(tramp) - 1;
-    *ptr = 0x48; // REX.w
-    ptr += 1;
-    *ptr = 0xba; // mov rdx
-    ptr += 1;
-    memcpy(ptr, &data, 8); // mov rdx, &data
-    ptr += 8;
-    // ; rdx = &data
-    // add rsp, 0x10 ; clean stack
-    // mov rdx, [rdx] ; restore rdx
-    // ret
-    const char tramp2[] = "\x48\x83\xc4\x10\x48\x8b\x12\xc3";
-    memcpy(ptr, (void*)tramp2, sizeof(tramp2) - 1);
-
-    memcpy(data + 0x8,  (void*)&uc, 8);
-    memcpy(data + 0x10, (void*)&handler, 8);
-#else
-    ptr = closure;
-    *ptr = 0xb8; // mov eax
-    ptr += 1;
-    memcpy(ptr, (void*)&data, 4); // mov eax, &data
-    ptr += 4;
-    // ; eax = &data
-    // mov [eax], edx; save edx
-    // mov [eax+0x4], ecx; save ecx
-    // mov ecx, [esp+4]; get ptr to exception because of cdecl
-    // mov edx, [eax+0x8]; get ptr to uc
-    // call [eax + 0xC]; get ptr to our handler, it's fastcall so we don't clean stac
-    const char tramp[] = "\x89\x10\x89\x48\x04\x8b\x4c\x24\x04\x8b\x50\x08\xff\x50\x0c";
-    memcpy(ptr, (void*)tramp, sizeof(tramp) - 1);
-    ptr += sizeof(tramp) - 1;
-    *ptr = 0xb9; // mov ecx
-    ptr += 1;
-    memcpy(ptr, (void*)&data, 4); // mov ecx, &data
-    ptr += 4;
-
-    // mov edx, [ecx] ; restore edx
-    // mov ecx, [ecx+4] ; restore ecx
-    // ret 4
-    const char tramp2[] = "\x8b\x11\x8b\x49\x04\xc2\x04\x00";
-    memcpy(ptr, (void*)tramp2, sizeof(tramp2) - 1);
-
-    memcpy(data + 0x8,  (void*)&uc, 4);
-    memcpy(data + 0xC, (void*)&handler, 4);
-#endif
-
-    uc->seh_handle = AddVectoredExceptionHandler(0, (PVECTORED_EXCEPTION_HANDLER)closure);
-    if (!uc->seh_handle) {
-        VirtualFree(uc->seh_closure, 0, MEM_RELEASE);
-        uc->seh_closure = NULL;
+    if (!code_gen_region_add(buf, size)) {
+        VirtualFree(buf, 0, MEM_RELEASE);
         return NULL;
     }
-
-    return VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    return buf;
 }
 void free_code_gen_buffer(struct uc_struct *uc)
 {
     TCGContext *tcg_ctx = uc->tcg_ctx;
     if (tcg_ctx->initial_buffer) {
-        may_remove_handler(uc);
+        // Out of the table first: no handler commits into it once it is released.
+        code_gen_region_remove(tcg_ctx->initial_buffer);
         VirtualFree(tcg_ctx->initial_buffer, 0, MEM_RELEASE);
     }
 }
